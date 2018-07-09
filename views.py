@@ -15,13 +15,18 @@ import logging
 logger = logging.getLogger(__name__)
 
 class DiscordCarbot:
-    hook_url = (
-        'https://discordapp.com/api/webhooks/{webhook_id}/{webhook_token}'
+    repeat_hook_url = (
+        'https://discordapp.com/api/webhooks/{repeat_webhook_id}/{repeat_webhook_token}'
+        .format(**settings.DISCORD)
+    )
+
+    broadcast_hook_url = (
+        'https://discordapp.com/api/webhooks/{broadcast_webhook_id}/{broadcast_webhook_token}'
         .format(**settings.DISCORD)
     )
 
     @staticmethod
-    def send_message(content=None, file=None, embeds=None, username=None, avatar_url=None, payload_json=None, tts=False):
+    def send_message(hook_url, content=None, file=None, embeds=None, username=None, avatar_url=None, payload_json=None, tts=False):
         """ Sends a message to Discord. Passes thru Discord API.
         
             Refer to Discord API documentation.
@@ -31,90 +36,83 @@ class DiscordCarbot:
         # remove it from data dict
         del data['file']
 
-        response = requests.post(DiscordCarbot.hook_url, 
+        response = requests.post(hook_url, 
                                  data=data, 
                                  files={ 'file' : file } if file is not None else None
                                  )
 
+        logger.info('Request sent to {}'.format(hook_url))
+
         try:
             response.raise_for_status()
         except:
-            requests.post(DiscordCarbot.hook_url,
+            requests.post(hook_url,
                           data=dict(content='Unable to forward a message from Line.')
                           )
             logger.error('Unable to forward a message from Line: {}', locals())
 
-
-def ignore_if_not_from_group(target_group_id):
-    """ Returns a decorator, that decorates an event handler such that the
-        function doesn't execute unless the event source is target_group_id.
-
-        Unhandled event source are logged; to find the naughty kids ;)
-    """
-    def decorator(decoratee):
-        def decorated(event):
-            if event.source.group_id == target_group_id:
-                try:
-                    decoratee(event)
-                except Exception as e:
-                    logger.error('Caught exception: {}'.format(e))
-                finally:
-                    return
-
-            logger.info('Message {evt.message} coming from source {evt.source} was ignored.'
-                        .format(evt=event))
-
-        return decorated
-    return decorator
-
 class LineCarbot:
     handler = WebhookHandler(settings.LINE['secret'])
     api = LineBotApi(settings.LINE['token'])
+    listening_groups = [ settings.LINE['capture_group_id'] ]
 
     @handler.add(MessageEvent, message=TextMessage)
-    @ignore_if_not_from_group(settings.LINE['capture_group_id'])
     def handle_text_message(event):
-        DiscordCarbot.send_message(
-            content=event.message.text,
-            **LineCarbot.get_user_overrides(event.source.user_id)
-        )
-       
+        if hasattr(event.source, 'group_id'):
+            if event.source.group_id in LineCarbot.listening_groups:
+                DiscordCarbot.send_message(
+                    DiscordCarbot.repeat_hook_url,
+                    content=event.message.text,
+                    **LineCarbot.get_user_overrides(event.source.user_id)
+                )
+        elif LineCarbot.user_in_listening_group(event.source.user_id):
+            logger.info('User {} sent a private text message with content {}.'.format(event.source, event.message.text))
+            DiscordCarbot.send_message(
+                DiscordCarbot.broadcast_hook_url,
+                content=event.message.text,
+            )
+        else:
+            logger.info('Message ignored as message source {} is not from listening groups.'.format(event.source))
+
+
     @handler.add(MessageEvent, message=ImageMessage)
-    @ignore_if_not_from_group(settings.LINE['capture_group_id'])
-    def handle_image_message(event):
-        DiscordCarbot.send_message(
-            **LineCarbot.get_file(event.message.id),
-            **LineCarbot.get_user_overrides(event.source.user_id)
-        )
-
     @handler.add(MessageEvent, message=VideoMessage)
-    @ignore_if_not_from_group(settings.LINE['capture_group_id'])
-    def handle_video_message(event):
-        DiscordCarbot.send_message(
-            **LineCarbot.get_file(event.message.id),
-            **LineCarbot.get_user_overrides(event.source.user_id)
-        )
-
     @handler.add(MessageEvent, message=AudioMessage)
-    @ignore_if_not_from_group(settings.LINE['capture_group_id'])
-    def handle_audio_message(event):
-        DiscordCarbot.send_message(
-            **LineCarbot.get_file(event.message.id),
-            **LineCarbot.get_user_overrides(event.source.user_id)
-        )
-
     @handler.add(MessageEvent, message=FileMessage)
-    @ignore_if_not_from_group(settings.LINE['capture_group_id'])
     def handle_file_message(event):
-        DiscordCarbot.send_message(
-            **LineCarbot.get_file(event.message.id),
-            **LineCarbot.get_user_overrides(event.source.user_id)
-        )
+        if hasattr(event.source, 'group_id'):
+            if event.source.group_id in LineCarbot.listening_groups:
+                DiscordCarbot.send_message(
+                    DiscordCarbot.repeat_hook_url,
+                    **LineCarbot.get_file(event.message.id),
+                    **LineCarbot.get_user_overrides(event.source.user_id)
+                )
+        elif LineCarbot.user_in_listening_group(event.source.user_id):
+            logger.info('User {} sent a private file message.'.format(event.source))
+            DiscordCarbot.send_message(
+                DiscordCarbot.broadcast_hook_url,
+                **LineCarbot.get_file(event.message.id),
+            )
+        else:
+            logger.info('Message ignored as message source {} is not from listening groups.'.format(event.source))
 
     @handler.default()
-    @ignore_if_not_from_group(settings.LINE['capture_group_id'])
     def default(event):
         logger.info('Received unhandled type of event {}.'.format(event))
+
+
+    @staticmethod
+    def user_in_listening_group(user_id):
+        for group_id in LineCarbot.listening_groups:
+            try:
+                # try to get the member profile,
+                # if successful then member is in one of the listening groups
+                LineCarbot.api.get_group_member_profile(group_id, user_id)
+                return True
+            except LineBotApiError:
+                pass
+       
+        return False
 
     @staticmethod
     def get_file(message_id):
