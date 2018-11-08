@@ -4,13 +4,14 @@ from django.conf import settings
 
 from linebot import LineBotApi, WebhookParser, WebhookHandler
 from linebot.exceptions import InvalidSignatureError, LineBotApiError
-from linebot.models import MessageEvent, TextMessage, ImageMessage, VideoMessage, AudioMessage, FileMessage
+from linebot.models import MessageEvent, TextMessage, StickerMessage, ImageMessage, VideoMessage, AudioMessage, FileMessage
 
 import functools
 import operator
 import requests
 import mimetypes
 import logging
+import json
 
 logger = logging.getLogger(__name__)
 
@@ -37,11 +38,10 @@ class DiscordCarbot:
         del data['file']
 
         response = requests.post(hook_url, 
-                                 data=data, 
+                                 json=data, # when there is embeds (line stickers), must use json
+                                 data=data if file is not None else None, # when there is file, json can't be used, fallback to use form data
                                  files={ 'file' : file } if file is not None else None
                                  )
-
-        logger.info('Request sent to {}'.format(hook_url))
 
         try:
             response.raise_for_status()
@@ -49,7 +49,7 @@ class DiscordCarbot:
             requests.post(hook_url,
                           data=dict(content='Unable to forward a message from Line.')
                           )
-            logger.error('Unable to forward a message from Line: {}', locals())
+            logger.error('Unable to forward a message from Line. Locals: {}, response: {}'.format(str(locals()), str(response.text)))
 
 class LineCarbot:
     handler = WebhookHandler(settings.LINE['secret'])
@@ -66,13 +66,27 @@ class LineCarbot:
                     **LineCarbot.get_user_overrides(event.source.user_id)
                 )
         elif LineCarbot.user_in_listening_group(event.source.user_id):
-            logger.info('User {} sent a private text message with content {}.'.format(event.source, event.message.text))
+            logger.info('Sent a private text message with content {}.'.format(event.message.text))
             DiscordCarbot.send_message(
                 DiscordCarbot.broadcast_hook_url,
                 content=event.message.text,
             )
         else:
-            logger.info('Message ignored as message source {} is not from listening groups.'.format(event.source))
+            logger.info('Text message ignored as message source {} is not from listening groups.'.format(event.source))
+
+    @handler.add(MessageEvent, message=StickerMessage)
+    def handle_sticker_message(event):
+        if hasattr(event.source, 'group_id'):
+            if event.source.group_id in LineCarbot.listening_groups:
+                DiscordCarbot.send_message(
+                    DiscordCarbot.repeat_hook_url,
+                    **LineCarbot.get_sticker_embed(event.message),
+                    **LineCarbot.get_user_overrides(event.source.user_id)
+                )
+        elif LineCarbot.user_in_listening_group(event.source.user_id):
+            logger.info('User {} sent a private sticker message, not forwarding since sending stickers through bot is not supported'.format(event.source))
+        else:
+            logger.info('Sticker message ignored as message source {} is not from listening groups.'.format(event.source))
 
 
     @handler.add(MessageEvent, message=ImageMessage)
@@ -94,7 +108,7 @@ class LineCarbot:
                 **LineCarbot.get_file(event.message.id),
             )
         else:
-            logger.info('Message ignored as message source {} is not from listening groups.'.format(event.source))
+            logger.info('File message ignored as message source {} is not from listening groups.'.format(event.source))
 
     @handler.default()
     def default(event):
@@ -107,12 +121,27 @@ class LineCarbot:
             try:
                 # try to get the member profile,
                 # if successful then member is in one of the listening groups
-                LineCarbot.api.get_group_member_profile(group_id, user_id)
+                profile = LineCarbot.api.get_group_member_profile(group_id, user_id)
+                logger.info('User: {}'.format(profile.display_name))
                 return True
             except LineBotApiError:
                 pass
        
         return False
+
+    @staticmethod
+    def get_sticker_embed(sticker_message):
+        """ Retrieves an embeds dict for displaying a sticker message in discord"""
+        return { 
+            'embeds' : [{
+                'image' : {
+                    'url' : 'https://stickershop.line-scdn.net/stickershop/v1/sticker/{sticker_id}/{platform}/sticker.png'.format(
+                        platform='android',
+                        sticker_id=sticker_message.sticker_id
+                    )
+                }
+            }]
+        }
 
     @staticmethod
     def get_file(message_id):
@@ -141,6 +170,8 @@ class LineCarbot:
             return guessed_ext
 
         filename = 'attachment' + get_ext(message_content.content_type);
+
+        logger.info('Sending {} with message_id={}'.format(filename, str(message_id)))
         return {
             'file' : (filename, functools.reduce(operator.add, message_content.iter_content())),
         }
