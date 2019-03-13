@@ -196,7 +196,9 @@ class LineCarbot:
         logger.info('User {} has avatar url {}'.format(profile.display_name, profile.picture_url))
 
         return { 
-            'username'   : profile.display_name,
+            # Discord requires a name to have at least 2 chars,
+            # so pad the 'undefined' symbol to a name < 2 characters
+            'username'   : '{:\U000e0000^2}'.format(profile.display_name),
             'avatar_url' : profile.picture_url,
         }
 
